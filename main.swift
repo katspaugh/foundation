@@ -42,114 +42,88 @@ final class WikiIndex: @unchecked Sendable {
         let snippet: String
     }
 
-    func search(_ query: String, limit: Int = 3) -> [Result] {
+    /// Searches for the given keywords with progressive relaxation: try all
+    /// terms (AND), then drop the last term, and so on. This keeps a single
+    /// stray keyword from hijacking the results the way a plain OR match would.
+    func search(terms: [String], limit: Int = 3) -> [Result] {
         guard let db else { return [] }
-        let words = query.components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-        guard !words.isEmpty else { return [] }
+        var clean: [String] = []
+        for term in terms {
+            for word in term.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            where word.count > 1 && !clean.contains(word.lowercased()) {
+                clean.append(word.lowercased())
+            }
+        }
+        guard !clean.isEmpty else { return [] }
 
-        // Quoted terms keep FTS5 syntax characters in user text from breaking the query.
-        let andQuery = words.map { "\"\($0)\"" }.joined(separator: " ")
-        let orQuery = words.map { "\"\($0)\"" }.joined(separator: " OR ")
-
-        // bm25() is negative-is-better; subtracting the popularity boost
-        // (log10 of incoming link count, precomputed by the indexer) keeps
-        // major articles ahead of obscure ones that merely repeat the terms.
         let sql = """
             SELECT title, substr(body, 1, 400), snippet(articles, 1, '', '', ' … ', 32)
             FROM articles WHERE articles MATCH ?
             ORDER BY bm25(articles, 10.0, 1.0) - 3.0 * boost LIMIT \(limit)
             """
-        for match in [andQuery, orQuery] {
+        var count = clean.count
+        while count >= 1 {
+            let match = clean.prefix(count).map { "\"\($0)\"" }.joined(separator: " ")
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
-            defer { sqlite3_finalize(stmt) }
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            sqlite3_bind_text(stmt, 1, match, -1, transient)
-
-            var results: [Result] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                results.append(Result(
-                    title: sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "",
-                    lede: sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "",
-                    snippet: sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
-                ))
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                defer { sqlite3_finalize(stmt) }
+                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                sqlite3_bind_text(stmt, 1, match, -1, transient)
+                var results: [Result] = []
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    results.append(Result(
+                        title: sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "",
+                        lede: sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "",
+                        snippet: sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                    ))
+                }
+                if !results.isEmpty { return results }
             }
-            if !results.isEmpty { return results }  // AND matched; skip OR fallback
+            count -= 1
         }
         return []
     }
 }
 
-// MARK: - Foundation Models tool
+// MARK: - Retrieval-augmented answering
 
-// The 3B model sometimes gets stuck re-calling the tool with ever-growing
-// queries until it overflows its 4k context. A hard per-prompt budget breaks
-// that loop: past the limit (or on a repeated query) the tool tells the model
-// to answer with what it already has.
-final class ToolCallBudget: @unchecked Sendable {
-    private let lock = NSLock()
-    private var remaining = 0
-    private var lastQuery = ""
-
-    func reset(_ calls: Int) {
-        lock.withLock { remaining = calls; lastQuery = "" }
-    }
-
-    /// Returns true if this call is allowed.
-    func allow(query: String) -> Bool {
-        lock.withLock {
-            if query == lastQuery { return false }
-            lastQuery = query
-            remaining -= 1
-            return remaining >= 0
-        }
-    }
+// Keywords the model pulls out of the question before we hit the index.
+// Extracting the topical nouns first keeps framing words ("farthest", "most",
+// "what") out of the search, which otherwise drag in unrelated articles.
+@Generable
+struct SearchTerms {
+    @Guide(description: "2 to 4 lowercase keywords naming the core subject and named entities of the question. Nouns only. Omit question words, verbs like 'is'/'can', and comparison words like 'farthest'/'biggest'/'most'.")
+    let terms: [String]
 }
 
-struct WikipediaSearchTool: Tool {
-    let budget: ToolCallBudget
-
-    let name = "searchWikipedia"
-    let description = """
-        Searches a local offline copy of Simple English Wikipedia and returns extracts \
-        from the most relevant articles. Use it to verify factual claims or answer \
-        factual questions.
-        """
-
-    @Generable
-    struct Arguments {
-        @Guide(description: "A few search keywords naming the main subject, e.g. 'Eiffel Tower height'")
-        let query: String
+enum FactChecker {
+    static func extractorSession() -> LanguageModelSession {
+        LanguageModelSession(instructions: """
+            You turn a user's question into search keywords for a Wikipedia \
+            full-text index. Extract only the core subject nouns and named \
+            entities. Drop framing words (what, how, farthest, most, biggest, \
+            can, is).
+            """)
     }
 
-    func call(arguments: Arguments) async throws -> String {
-        guard budget.allow(query: arguments.query) else {
-            return "You have already searched. Do NOT call searchWikipedia again. " +
-                   "Answer the user now using the extracts you already received."
-        }
-        let results = WikiIndex.shared.search(arguments.query)
-        guard !results.isEmpty else {
-            return "No Wikipedia articles matched '\(arguments.query)'. Try different keywords."
-        }
-        return results.enumerated().map { index, r in
-            index == 0
-                ? "Article: \(r.title)\n\(r.lede)\nRelevant passage: \(r.snippet)"
-                : "Article: \(r.title)\nRelevant passage: \(r.snippet)"
-        }.joined(separator: "\n\n")
+    static func answerSession() -> LanguageModelSession {
+        LanguageModelSession(instructions: """
+            Answer the user's question using ONLY the provided Wikipedia extracts. \
+            Cite the article titles you used. If the extracts are off-topic or \
+            don't contain the answer, say the local Simple English Wikipedia \
+            doesn't cover it — do NOT fall back on outside knowledge and do NOT \
+            force an answer out of unrelated text.
+            """)
     }
-}
 
-func makeSession(budget: ToolCallBudget) -> LanguageModelSession {
-    guard WikiIndex.shared.isAvailable else { return LanguageModelSession() }
-    return LanguageModelSession(tools: [WikipediaSearchTool(budget: budget)], instructions: """
-        You are a fact-checking assistant. You have a searchWikipedia tool backed by a \
-        local copy of Simple English Wikipedia. For any factual claim or question from \
-        the user, call searchWikipedia ONCE with keywords for the main subject, then \
-        answer based on the returned extracts, naming the article(s) you relied on. \
-        If the extracts don't contain the answer, say the local Wikipedia copy doesn't \
-        settle it — do not guess.
-        """)
+    static func plainSession() -> LanguageModelSession {
+        LanguageModelSession()
+    }
+
+    static func format(_ results: [WikiIndex.Result]) -> String {
+        results.map { "Article: \($0.title)\n\($0.lede)\nRelevant passage: \($0.snippet)" }
+            .joined(separator: "\n\n")
+    }
 }
 
 // MARK: - UI
@@ -157,10 +131,10 @@ func makeSession(budget: ToolCallBudget) -> LanguageModelSession {
 struct ContentView: View {
     @State private var prompt = ""
     @State private var response = ""
+    @State private var sources: [String] = []
     @State private var errorMessage: String?
     @State private var isQuerying = false
-    private static let budget = ToolCallBudget()
-    @State private var session = makeSession(budget: ContentView.budget)
+    @State private var useWikipedia = false
 
     private let model = SystemLanguageModel.default
 
@@ -190,12 +164,12 @@ struct ContentView: View {
                 Button("Submit", action: submit)
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(isQuerying || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("New Session") {
-                    session = makeSession(budget: ContentView.budget)
-                    response = ""
-                    errorMessage = nil
-                }
-                .disabled(isQuerying)
+                Toggle("Fact-check with Wikipedia", isOn: $useWikipedia)
+                    .toggleStyle(.checkbox)
+                    .disabled(!WikiIndex.shared.isAvailable)
+                    .help(WikiIndex.shared.isAvailable
+                          ? "Retrieve extracts from local Simple English Wikipedia and answer from them."
+                          : "Local Wikipedia index not found — run ./indexer (see README).")
                 if isQuerying {
                     ProgressView()
                         .controlSize(.small)
@@ -211,15 +185,22 @@ struct ContentView: View {
             Text("Response")
                 .font(.headline)
             ScrollView {
-                if let errorMessage {
-                    Text(errorMessage)
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Text(response)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 10) {
+                    if let errorMessage {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                    } else {
+                        Text(response)
+                            .textSelection(.enabled)
+                    }
+                    if !sources.isEmpty {
+                        Text("Sources: " + sources.joined(separator: ", "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: .infinity)
 
@@ -249,28 +230,28 @@ struct ContentView: View {
     }
 
     private func submit() {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
         isQuerying = true
         errorMessage = nil
         response = ""
+        sources = []
         Task {
             // The on-device model occasionally aborts mid-generation
             // (tokengeneration error 10); one retry usually recovers.
             for attempt in 1...2 {
-                ContentView.budget.reset(2)
                 do {
-                    // Stream so the response appears as it's generated.
-                    let stream = session.streamResponse(to: text)
-                    for try await partial in stream {
-                        response = partial.content
-                    }
+                    try await runQuery(question)
                     errorMessage = nil
                     break
+                } catch is CancellationError {
+                    break
                 } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
-                    errorMessage = "The session ran out of context (4,096 tokens). Start a New Session."
+                    errorMessage = "The question retrieved too much text to fit the model's context. Try a narrower question."
                     break
                 } catch {
+                    response = ""
+                    sources = []
                     errorMessage = attempt == 1
                         ? "Generation failed, retrying…"
                         : "Error: \(error.localizedDescription)"
@@ -278,6 +259,29 @@ struct ContentView: View {
             }
             isQuerying = false
         }
+    }
+
+    private func runQuery(_ question: String) async throws {
+        guard useWikipedia && WikiIndex.shared.isAvailable else {
+            // Bare model: plain query, no retrieval.
+            let stream = FactChecker.plainSession().streamResponse(to: question)
+            for try await partial in stream { response = partial.content }
+            return
+        }
+
+        // 1. Extract topical keywords, 2. retrieve, 3. answer grounded in extracts.
+        let terms = try await FactChecker.extractorSession()
+            .respond(to: question, generating: SearchTerms.self).content.terms
+        let results = WikiIndex.shared.search(terms: terms)
+        sources = results.map(\.title)
+
+        let context = results.isEmpty
+            ? "No matching Wikipedia articles were found."
+            : FactChecker.format(results)
+        let grounded = "Question: \(question)\n\nWikipedia extracts:\n\(context)"
+
+        let stream = FactChecker.answerSession().streamResponse(to: grounded)
+        for try await partial in stream { response = partial.content }
     }
 }
 
