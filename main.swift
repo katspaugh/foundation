@@ -62,24 +62,17 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: .infinity)
+
+            Text(Chat.modelSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
     private func unavailableView(_ reason: SystemLanguageModel.Availability.UnavailableReason) -> some View {
-        let message: String
-        switch reason {
-        case .deviceNotEligible:
-            message = "This Mac doesn't support Apple Intelligence."
-        case .appleIntelligenceNotEnabled:
-            message = "Apple Intelligence is turned off. Enable it in System Settings > Apple Intelligence & Siri."
-        case .modelNotReady:
-            message = "The model is still downloading or preparing. Try again in a bit."
-        @unknown default:
-            message = "The model is unavailable for an unknown reason."
-        }
-        return ContentUnavailableView("Model Unavailable",
-                                      systemImage: "exclamationmark.triangle",
-                                      description: Text(message))
+        ContentUnavailableView("Model Unavailable",
+                               systemImage: "exclamationmark.triangle",
+                               description: Text(Chat.unavailableMessage(reason)))
     }
 
     private func submit() {
@@ -89,25 +82,22 @@ struct ContentView: View {
         errorMessage = nil
         response = ""
         Task {
-            // The on-device model occasionally aborts mid-generation
-            // (tokengeneration error 10); one retry usually recovers.
-            for attempt in 1...2 {
-                do {
-                    let stream = LanguageModelSession().streamResponse(to: question)
-                    for try await partial in stream { response = partial.content }
-                    errorMessage = nil
-                    break
-                } catch is CancellationError {
-                    break
-                } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
-                    errorMessage = "The prompt is too long for the model's context. Try a shorter one."
-                    break
-                } catch {
-                    response = ""
-                    errorMessage = attempt == 1
-                        ? "Generation failed, retrying…"
-                        : "Error: \(error.localizedDescription)"
-                }
+            do {
+                try await Chat.answer(
+                    question,
+                    onRetry: {
+                        response = ""
+                        errorMessage = "Generation failed, retrying…"
+                    },
+                    onPartial: {
+                        errorMessage = nil
+                        response = $0
+                    })
+            } catch is CancellationError {
+                // Nothing to report.
+            } catch {
+                response = ""
+                errorMessage = Chat.describe(error)
             }
             isQuerying = false
         }

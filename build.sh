@@ -1,14 +1,14 @@
 #!/bin/zsh
-# Builds FoundationChat.app from main.swift. No Xcode project needed.
+# Builds FoundationChat.app (GUI) and isaac (CLI). No Xcode project needed.
 set -e
 cd "$(dirname "$0")"
 
-swiftc -O main.swift -o FoundationChat
+TARGET=arm64-apple-macos27.0
 
 APP=FoundationChat.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-mv FoundationChat "$APP/Contents/MacOS/FoundationChat"
+swiftc -O -target $TARGET Core.swift main.swift -o "$APP/Contents/MacOS/FoundationChat"
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,9 +24,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>26.0</string>
+    <string>27.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
@@ -34,4 +34,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 EOF
 
 codesign --force --sign - "$APP"
+
+swiftc -O -target $TARGET -parse-as-library Core.swift cli.swift -o isaac
+codesign --force --sign - isaac
+
 echo "Built $APP — launch with: open $APP"
+echo "Built isaac — try: ./isaac --help"
